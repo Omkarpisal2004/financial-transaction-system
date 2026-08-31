@@ -1,2 +1,7 @@
-package com.financialtransaction.user.entity;public class UserStatus {
+package com.financialtransaction.user.entity;
+
+public  enum UserStatus {
+
+    ACTIVE,
+    BLOCKED
 }
