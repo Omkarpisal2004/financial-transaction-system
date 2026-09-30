@@ -7,6 +7,7 @@ import com.financialtransaction.transfer.dto.TransferResponse;
 import com.financialtransaction.transfer.entity.Transfer;
 import com.financialtransaction.transfer.entity.TransferStatus;
 import com.financialtransaction.transfer.repository.TransferRepository;
+import jakarta.transaction.Transactional;
 import org.springframework.stereotype.Service;
 
 import java.util.UUID;
@@ -23,6 +24,7 @@ public class TransferService {
         this.transferRepository = transferRepository;
     }
 
+    @Transactional
     public TransferResponse createTransfer(TransferRequest request) {
         if (request.amount() == null || request.amount().compareTo(BigDecimal.ZERO) <= 0) {
             throw new IllegalArgumentException("Transfer amount must be positive");
@@ -44,6 +46,8 @@ public class TransferService {
         fromAccount.setBalance(fromAccount.getBalance().subtract(request.amount()));
         // Credit
         toAccount.setBalance(toAccount.getBalance().add(request.amount()));
+
+
 
         accountRepository.save(fromAccount);
         accountRepository.save(toAccount);
