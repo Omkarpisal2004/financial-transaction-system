@@ -6,6 +6,8 @@ import com.financialtransaction.account.entity.Account;
 import com.financialtransaction.account.repository.AccountRepository;
 import com.financialtransaction.user.entity.User;
 import com.financialtransaction.user.repository.UserRepository;
+import org.springframework.security.access.AccessDeniedException;
+import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
@@ -22,6 +24,7 @@ public class AccountService {
     }
 
     public AccountResponse createAccount(AccountCreateRequest request) {
+        // ... same as before
         User user = userRepository.findById(request.userId())
                 .orElseThrow(() -> new IllegalArgumentException("User not found: " + request.userId()));
 
@@ -46,12 +49,21 @@ public class AccountService {
     public AccountResponse getAccountById(Long id) {
         Account account = accountRepository.findById(id)
                 .orElseThrow(() -> new IllegalArgumentException("Account not found: " + id));
+        verifyOwnership(account);
         return AccountResponse.from(account);
     }
 
     public BigDecimal getBalance(Long id) {
         Account account = accountRepository.findById(id)
                 .orElseThrow(() -> new IllegalArgumentException("Account not found: " + id));
+        verifyOwnership(account);
         return account.getBalance();
+    }
+
+    private void verifyOwnership(Account account) {
+        Long currentUserId = (Long) SecurityContextHolder.getContext().getAuthentication().getPrincipal();
+        if (!account.getUser().getId().equals(currentUserId)) {
+            throw new AccessDeniedException("You do not have permission to access this account");
+        }
     }
 }
