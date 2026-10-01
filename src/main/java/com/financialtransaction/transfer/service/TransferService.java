@@ -40,10 +40,18 @@ public class TransferService {
             throw new IllegalArgumentException("Cannot transfer to the same account");
         }
 
-        Account fromAccount = accountRepository.findById(request.fromAccountId())
-                .orElseThrow(() -> new IllegalArgumentException("From account not found: " + request.fromAccountId()));
-        Account toAccount = accountRepository.findById(request.toAccountId())
-                .orElseThrow(() -> new IllegalArgumentException("To account not found: " + request.toAccountId()));
+        // LOCK ORDERING: always lock the lower ID first, to prevent deadlocks
+        Long firstLockId = Math.min(request.fromAccountId(), request.toAccountId());
+        Long secondLockId = Math.max(request.fromAccountId(), request.toAccountId());
+
+        Account firstLocked = accountRepository.findByIdForUpdate(firstLockId)
+                .orElseThrow(() -> new IllegalArgumentException("Account not found: " + firstLockId));
+        Account secondLocked = accountRepository.findByIdForUpdate(secondLockId)
+                .orElseThrow(() -> new IllegalArgumentException("Account not found: " + secondLockId));
+
+        // Now resolve which is "from" and which is "to"
+        Account fromAccount = firstLocked.getId().equals(request.fromAccountId()) ? firstLocked : secondLocked;
+        Account toAccount = firstLocked.getId().equals(request.toAccountId()) ? firstLocked : secondLocked;
 
         if (fromAccount.getBalance().compareTo(request.amount()) < 0) {
             throw new IllegalArgumentException("Insufficient balance in account: " + fromAccount.getAccountNumber());
