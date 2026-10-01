@@ -1,6 +1,5 @@
 package com.financialtransaction.transfer.controller;
 
-
 import com.financialtransaction.transfer.dto.TransferRequest;
 import com.financialtransaction.transfer.dto.TransferResponse;
 import com.financialtransaction.transfer.service.TransferService;
@@ -19,8 +18,10 @@ public class TransferController {
     }
 
     @PostMapping
-    public ResponseEntity<TransferResponse> createTransfer(@RequestBody TransferRequest request) {
-        TransferResponse response = transferService.createTransfer(request);
+    public ResponseEntity<TransferResponse> createTransfer(
+            @RequestHeader(value = "Idempotency-Key", required = false) String idempotencyKey,
+            @RequestBody TransferRequest request) {
+        TransferResponse response = transferService.createTransferIdempotent(idempotencyKey, request);
         return ResponseEntity.status(HttpStatus.CREATED).body(response);
     }
 
@@ -28,5 +29,4 @@ public class TransferController {
     public ResponseEntity<TransferResponse> getTransfer(@PathVariable String transactionId) {
         return ResponseEntity.ok(transferService.getByTransactionId(transactionId));
     }
-
 }

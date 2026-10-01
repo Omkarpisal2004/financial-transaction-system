@@ -2,6 +2,10 @@ package com.financialtransaction.transfer.service;
 
 import com.financialtransaction.account.entity.Account;
 import com.financialtransaction.account.repository.AccountRepository;
+import com.financialtransaction.idempotency.entity.IdempotencyRecord;
+import com.financialtransaction.idempotency.entity.IdempotencyStatus;
+import com.financialtransaction.idempotency.repository.IdempotencyRecordRepository;
+import com.financialtransaction.idempotency.util.HashUtil;
 import com.financialtransaction.ledger.entity.EntryType;
 import com.financialtransaction.ledger.entity.LedgerEntry;
 import com.financialtransaction.ledger.repository.LedgerEntryRepository;
@@ -12,6 +16,7 @@ import com.financialtransaction.transfer.entity.TransferStatus;
 import com.financialtransaction.transfer.repository.TransferRepository;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import tools.jackson.databind.ObjectMapper;
 
 import java.math.BigDecimal;
 import java.util.UUID;
@@ -22,14 +27,77 @@ public class TransferService {
     private final AccountRepository accountRepository;
     private final TransferRepository transferRepository;
     private final LedgerEntryRepository ledgerEntryRepository;
+    private final IdempotencyRecordRepository idempotencyRecordRepository;
+    private final ObjectMapper objectMapper = new ObjectMapper();
 
     public TransferService(AccountRepository accountRepository,
                            TransferRepository transferRepository,
-                           LedgerEntryRepository ledgerEntryRepository) {
+                           LedgerEntryRepository ledgerEntryRepository,
+                           IdempotencyRecordRepository idempotencyRecordRepository) {
         this.accountRepository = accountRepository;
         this.transferRepository = transferRepository;
         this.ledgerEntryRepository = ledgerEntryRepository;
+        this.idempotencyRecordRepository = idempotencyRecordRepository;
     }
+
+
+    @Transactional
+    public TransferResponse createTransferIdempotent(String idempotencyKey, TransferRequest request) {
+        // If no key provided, just process normally (idempotency optional)
+        if (idempotencyKey == null || idempotencyKey.isBlank()) {
+            return createTransfer(request);
+        }
+
+        String requestPayload;
+        try {
+            requestPayload = objectMapper.writeValueAsString(request);
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to serialize request", e);
+        }
+        String requestHash = HashUtil.sha256(requestPayload);
+
+        var existingOpt = idempotencyRecordRepository.findByIdempotencyKey(idempotencyKey);
+
+        if (existingOpt.isPresent()) {
+            IdempotencyRecord existing = existingOpt.get();
+
+            if (!existing.getRequestHash().equals(requestHash)) {
+                throw new IllegalArgumentException(
+                        "Idempotency key already used with a different request payload: " + idempotencyKey);
+            }
+
+            if (existing.getStatus() == IdempotencyStatus.COMPLETED) {
+                try {
+                    return objectMapper.readValue(existing.getResponseBody(), TransferResponse.class);
+                } catch (Exception e) {
+                    throw new RuntimeException("Failed to deserialize stored response", e);
+                }
+            }
+
+            // IN_PROGRESS or FAILED — for simplicity, reject concurrent duplicate while in progress
+            throw new IllegalStateException("Request with this idempotency key is already being processed: " + idempotencyKey);
+        }
+
+        // New key — create a record in IN_PROGRESS state first
+        IdempotencyRecord record = new IdempotencyRecord();
+        record.setIdempotencyKey(idempotencyKey);
+        record.setRequestHash(requestHash);
+        record.setStatus(IdempotencyStatus.IN_PROGRESS);
+        idempotencyRecordRepository.save(record);
+
+        TransferResponse response = createTransfer(request);
+
+        try {
+            record.setResponseBody(objectMapper.writeValueAsString(response));
+            record.setStatus(IdempotencyStatus.COMPLETED);
+            idempotencyRecordRepository.save(record);
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to serialize response for idempotency record", e);
+        }
+
+        return response;
+    }
+
 
     @Transactional
     public TransferResponse createTransfer(TransferRequest request) {
