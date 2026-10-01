@@ -2,6 +2,7 @@ package com.financialtransaction.transfer.service;
 
 import com.financialtransaction.account.entity.Account;
 import com.financialtransaction.account.repository.AccountRepository;
+import com.financialtransaction.audit.service.AuditService;
 import com.financialtransaction.idempotency.entity.IdempotencyRecord;
 import com.financialtransaction.idempotency.entity.IdempotencyStatus;
 import com.financialtransaction.idempotency.repository.IdempotencyRecordRepository;
@@ -14,6 +15,7 @@ import com.financialtransaction.transfer.dto.TransferResponse;
 import com.financialtransaction.transfer.entity.Transfer;
 import com.financialtransaction.transfer.entity.TransferStatus;
 import com.financialtransaction.transfer.repository.TransferRepository;
+import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import tools.jackson.databind.ObjectMapper;
@@ -29,15 +31,18 @@ public class TransferService {
     private final LedgerEntryRepository ledgerEntryRepository;
     private final IdempotencyRecordRepository idempotencyRecordRepository;
     private final ObjectMapper objectMapper = new ObjectMapper();
+    private final AuditService auditService;
 
     public TransferService(AccountRepository accountRepository,
                            TransferRepository transferRepository,
                            LedgerEntryRepository ledgerEntryRepository,
-                           IdempotencyRecordRepository idempotencyRecordRepository) {
+                           IdempotencyRecordRepository idempotencyRecordRepository,
+                           AuditService auditService) {
         this.accountRepository = accountRepository;
         this.transferRepository = transferRepository;
         this.ledgerEntryRepository = ledgerEntryRepository;
         this.idempotencyRecordRepository = idempotencyRecordRepository;
+        this.auditService = auditService;
     }
 
 
@@ -101,64 +106,70 @@ public class TransferService {
 
     @Transactional
     public TransferResponse createTransfer(TransferRequest request) {
-        if (request.amount() == null || request.amount().compareTo(BigDecimal.ZERO) <= 0) {
-            throw new IllegalArgumentException("Transfer amount must be positive");
+        Long currentUserId = (Long) SecurityContextHolder.getContext().getAuthentication().getPrincipal();
+
+        try {
+            if (request.amount() == null || request.amount().compareTo(BigDecimal.ZERO) <= 0) {
+                throw new IllegalArgumentException("Transfer amount must be positive");
+            }
+            if (request.fromAccountId().equals(request.toAccountId())) {
+                throw new IllegalArgumentException("Cannot transfer to the same account");
+            }
+
+            Long firstLockId = Math.min(request.fromAccountId(), request.toAccountId());
+            Long secondLockId = Math.max(request.fromAccountId(), request.toAccountId());
+
+            Account firstLocked = accountRepository.findByIdForUpdate(firstLockId)
+                    .orElseThrow(() -> new IllegalArgumentException("Account not found: " + firstLockId));
+            Account secondLocked = accountRepository.findByIdForUpdate(secondLockId)
+                    .orElseThrow(() -> new IllegalArgumentException("Account not found: " + secondLockId));
+
+            Account fromAccount = firstLocked.getId().equals(request.fromAccountId()) ? firstLocked : secondLocked;
+            Account toAccount = firstLocked.getId().equals(request.toAccountId()) ? firstLocked : secondLocked;
+
+            if (fromAccount.getBalance().compareTo(request.amount()) < 0) {
+                throw new IllegalArgumentException("Insufficient balance in account: " + fromAccount.getAccountNumber());
+            }
+
+            fromAccount.setBalance(fromAccount.getBalance().subtract(request.amount()));
+            accountRepository.save(fromAccount);
+
+            toAccount.setBalance(toAccount.getBalance().add(request.amount()));
+            accountRepository.save(toAccount);
+
+            Transfer transfer = new Transfer();
+            transfer.setTransactionId(UUID.randomUUID().toString());
+            transfer.setFromAccount(fromAccount);
+            transfer.setToAccount(toAccount);
+            transfer.setAmount(request.amount());
+            transfer.setStatus(TransferStatus.SUCCESS);
+            Transfer savedTransfer = transferRepository.save(transfer);
+
+            LedgerEntry debitEntry = new LedgerEntry();
+            debitEntry.setTransfer(savedTransfer);
+            debitEntry.setAccount(fromAccount);
+            debitEntry.setEntryType(EntryType.DEBIT);
+            debitEntry.setAmount(request.amount());
+            ledgerEntryRepository.save(debitEntry);
+
+            LedgerEntry creditEntry = new LedgerEntry();
+            creditEntry.setTransfer(savedTransfer);
+            creditEntry.setAccount(toAccount);
+            creditEntry.setEntryType(EntryType.CREDIT);
+            creditEntry.setAmount(request.amount());
+            ledgerEntryRepository.save(creditEntry);
+
+            auditService.log(currentUserId, "TRANSFER_COMPLETED", savedTransfer.getTransactionId(), "SUCCESS",
+                    "Transferred " + request.amount() + " from account " + fromAccount.getId() + " to " + toAccount.getId());
+
+            return TransferResponse.from(savedTransfer);
+
+        } catch (Exception e) {
+            auditService.log(currentUserId, "TRANSFER_FAILED", null, "FAILURE", e.getMessage());
+            throw e;  // re-throw so the transaction still rolls back and the error still reaches the client
         }
-        if (request.fromAccountId().equals(request.toAccountId())) {
-            throw new IllegalArgumentException("Cannot transfer to the same account");
-        }
-
-        // LOCK ORDERING: always lock the lower ID first, to prevent deadlocks
-        Long firstLockId = Math.min(request.fromAccountId(), request.toAccountId());
-        Long secondLockId = Math.max(request.fromAccountId(), request.toAccountId());
-
-        Account firstLocked = accountRepository.findByIdForUpdate(firstLockId)
-                .orElseThrow(() -> new IllegalArgumentException("Account not found: " + firstLockId));
-        Account secondLocked = accountRepository.findByIdForUpdate(secondLockId)
-                .orElseThrow(() -> new IllegalArgumentException("Account not found: " + secondLockId));
-
-        // Now resolve which is "from" and which is "to"
-        Account fromAccount = firstLocked.getId().equals(request.fromAccountId()) ? firstLocked : secondLocked;
-        Account toAccount = firstLocked.getId().equals(request.toAccountId()) ? firstLocked : secondLocked;
-
-        if (fromAccount.getBalance().compareTo(request.amount()) < 0) {
-            throw new IllegalArgumentException("Insufficient balance in account: " + fromAccount.getAccountNumber());
-        }
-
-        // Debit
-        fromAccount.setBalance(fromAccount.getBalance().subtract(request.amount()));
-        accountRepository.save(fromAccount);
-
-        // Credit
-        toAccount.setBalance(toAccount.getBalance().add(request.amount()));
-        accountRepository.save(toAccount);
-
-        // Create Transfer record
-        Transfer transfer = new Transfer();
-        transfer.setTransactionId(UUID.randomUUID().toString());
-        transfer.setFromAccount(fromAccount);
-        transfer.setToAccount(toAccount);
-        transfer.setAmount(request.amount());
-        transfer.setStatus(TransferStatus.SUCCESS);
-        Transfer savedTransfer = transferRepository.save(transfer);
-
-        // Create Ledger Entries — exactly 1 DEBIT + 1 CREDIT
-        LedgerEntry debitEntry = new LedgerEntry();
-        debitEntry.setTransfer(savedTransfer);
-        debitEntry.setAccount(fromAccount);
-        debitEntry.setEntryType(EntryType.DEBIT);
-        debitEntry.setAmount(request.amount());
-        ledgerEntryRepository.save(debitEntry);
-
-        LedgerEntry creditEntry = new LedgerEntry();
-        creditEntry.setTransfer(savedTransfer);
-        creditEntry.setAccount(toAccount);
-        creditEntry.setEntryType(EntryType.CREDIT);
-        creditEntry.setAmount(request.amount());
-        ledgerEntryRepository.save(creditEntry);
-
-        return TransferResponse.from(savedTransfer);
     }
+
 
     public TransferResponse getByTransactionId(String transactionId) {
         Transfer transfer = transferRepository.findByTransactionId(transactionId)
