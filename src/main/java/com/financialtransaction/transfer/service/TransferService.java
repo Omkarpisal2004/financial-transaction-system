@@ -15,6 +15,9 @@ import com.financialtransaction.transfer.dto.TransferResponse;
 import com.financialtransaction.transfer.entity.Transfer;
 import com.financialtransaction.transfer.entity.TransferStatus;
 import com.financialtransaction.transfer.repository.TransferRepository;
+import io.micrometer.core.instrument.MeterRegistry;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -32,18 +35,24 @@ public class TransferService {
     private final IdempotencyRecordRepository idempotencyRecordRepository;
     private final ObjectMapper objectMapper = new ObjectMapper();
     private final AuditService auditService;
+    private static final Logger logger = LoggerFactory.getLogger(TransferService.class);
+    private final MeterRegistry meterRegistry;
 
     public TransferService(AccountRepository accountRepository,
                            TransferRepository transferRepository,
                            LedgerEntryRepository ledgerEntryRepository,
                            IdempotencyRecordRepository idempotencyRecordRepository,
-                           AuditService auditService) {
+                           AuditService auditService,
+                           MeterRegistry meterRegistry) {
         this.accountRepository = accountRepository;
         this.transferRepository = transferRepository;
         this.ledgerEntryRepository = ledgerEntryRepository;
         this.idempotencyRecordRepository = idempotencyRecordRepository;
         this.auditService = auditService;
+        this.meterRegistry = meterRegistry;
     }
+
+
 
 
     @Transactional
@@ -107,6 +116,10 @@ public class TransferService {
     @Transactional
     public TransferResponse createTransfer(TransferRequest request) {
         Long currentUserId = (Long) SecurityContextHolder.getContext().getAuthentication().getPrincipal();
+        String txnId = UUID.randomUUID().toString(); // generate early for logging consistency
+
+        logger.info("Transfer started: from={}, to={}, amount={}, user={}",
+                request.fromAccountId(), request.toAccountId(), request.amount(), currentUserId);
 
         try {
             if (request.amount() == null || request.amount().compareTo(BigDecimal.ZERO) <= 0) {
@@ -162,11 +175,17 @@ public class TransferService {
             auditService.log(currentUserId, "TRANSFER_COMPLETED", savedTransfer.getTransactionId(), "SUCCESS",
                     "Transferred " + request.amount() + " from account " + fromAccount.getId() + " to " + toAccount.getId());
 
+            logger.info("Transfer completed: txnId={}, amount={}", savedTransfer.getTransactionId(), request.amount());
+            meterRegistry.counter("transfers.success").increment();
+
             return TransferResponse.from(savedTransfer);
 
         } catch (Exception e) {
+            logger.error("Transfer failed: from={}, to={}, reason={}",
+                    request.fromAccountId(), request.toAccountId(), e.getMessage());
             auditService.log(currentUserId, "TRANSFER_FAILED", null, "FAILURE", e.getMessage());
-            throw e;  // re-throw so the transaction still rolls back and the error still reaches the client
+            meterRegistry.counter("transfers.failure").increment();
+            throw e;
         }
     }
 
