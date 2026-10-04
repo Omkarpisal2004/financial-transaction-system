@@ -37,7 +37,7 @@ public class AuditLog {
     private String result;
 
     @Lob
-    @Column(name = "details")
+    @Column(name = "details" , columnDefinition = "TEXT")
     private String details;
 
     @Column(nullable = false, updatable = false)
