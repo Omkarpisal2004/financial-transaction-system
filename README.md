@@ -24,6 +24,22 @@ A Java Spring Boot REST API for managing users and bank accounts, processing acc
 - [Configuration and Security Notes](#configuration-and-security-notes)
 - [Known Scope and Limitations](#known-scope-and-limitations)
 
+
+## Live Demo
+
+The application is deployed on Render and can be accessed through the following links:
+
+| Resource     | Link                                                                    |
+| ------------ | ----------------------------------------------------------------------- |
+| Backend API  | https://financial-transaction-system.onrender.com                       |
+| Swagger UI   | https://financial-transaction-system.onrender.com/swagger-ui/index.html |
+| Health Check | https://financial-transaction-system.onrender.com/actuator/health       |
+
+Note: The application runs on Render's free tier. Initial requests may take some time if the instance is inactive.
+Use Swagger UI to explore the available REST APIs and test endpoints .
+
+
+
 ## Overview
 
 The application exposes REST endpoints for user registration and login, account creation and deposits, balance and transaction-history queries, account transfers, administrative user-status changes, and reconciliation.
