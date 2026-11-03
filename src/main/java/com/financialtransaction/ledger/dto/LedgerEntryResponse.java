@@ -16,7 +16,9 @@ public record LedgerEntryResponse(
     public static LedgerEntryResponse from(LedgerEntry entry) {
         return new LedgerEntryResponse(
                 entry.getId(),
-                entry.getTransfer().getTransactionId(),
+                entry.getTransfer() != null
+                        ? entry.getTransfer().getTransactionId()
+                        : null,
                 entry.getAccount().getId(),
                 entry.getEntryType().name(),
                 entry.getAmount(),

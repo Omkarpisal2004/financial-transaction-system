@@ -39,7 +39,12 @@ public class Account {
     )
     private User user;
 
-    @Column(name = "account_number", nullable = false, length = 20)
+    @Column(
+            name = "account_number",
+            nullable = false,
+            length = 20,
+            updatable = false
+    )
     private String accountNumber;
 
     @Column(nullable = false, precision = 19, scale = 4)
@@ -53,7 +58,12 @@ public class Account {
     @Column(nullable = false, length = 20)
     private AccountStatus status;
 
-    @Version
+    @Enumerated(EnumType.STRING)
+    @Column(name = "account_type", nullable = false, length = 20)
+    private AccountType accountType;
+
+
+    @Version // for optimistic locking
     @Column(nullable = false)
     private Long version;
 

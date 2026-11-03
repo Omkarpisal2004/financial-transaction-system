@@ -1,22 +1,26 @@
 package com.financialtransaction.transfer.service;
 
-import com.financialtransaction.account.entity.Account;
-import com.financialtransaction.account.entity.AccountStatus;
-import com.financialtransaction.account.entity.Currency;
-import com.financialtransaction.account.repository.AccountRepository;
 import com.financialtransaction.audit.service.AuditService;
-import com.financialtransaction.idempotency.repository.IdempotencyRecordRepository;
-import com.financialtransaction.ledger.repository.LedgerEntryRepository;
+import com.financialtransaction.idempotency.service.IdempotencyService;
+import com.financialtransaction.security.userdetails.UserPrincipal;
 import com.financialtransaction.transfer.dto.TransferRequest;
+import com.financialtransaction.transfer.dto.TransferResponse;
 import com.financialtransaction.transfer.repository.TransferRepository;
+
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
 import org.springframework.security.core.context.SecurityContextHolder;
+
+import tools.jackson.databind.ObjectMapper;
 
 import java.math.BigDecimal;
 import java.util.Collections;
@@ -28,78 +32,175 @@ import static org.mockito.Mockito.*;
 @ExtendWith(MockitoExtension.class)
 class TransferServiceTest {
 
-    @Mock private AccountRepository accountRepository;
-    @Mock private TransferRepository transferRepository;
-    @Mock private LedgerEntryRepository ledgerEntryRepository;
-    @Mock private IdempotencyRecordRepository idempotencyRecordRepository;
-    @Mock private AuditService auditService;
+    @Mock
+    private TransferRepository transferRepository;
+
+    @Mock
+    private IdempotencyService idempotencyService;
+
+    @Mock
+    private TransferInitiationService transferInitiationService;
+
+    @Mock
+    private TransferProcessingService transferProcessingService;
+
+    @Mock
+    private TransferFailureService transferFailureService;
+
+    @Mock
+    private AuditService auditService;
+
+    @Mock
+    private UserPrincipal principal;
 
     private TransferService transferService;
 
     @BeforeEach
     void setup() {
+
         transferService = new TransferService(
-                accountRepository, transferRepository, ledgerEntryRepository,
-                idempotencyRecordRepository, auditService, new SimpleMeterRegistry());
+                transferRepository,
+                idempotencyService,
+                transferInitiationService,
+                transferProcessingService,
+                transferFailureService,
+                new ObjectMapper(),
+                auditService,
+                new SimpleMeterRegistry()
+        );
+
+        when(principal.getId()).thenReturn(1L);
 
         UsernamePasswordAuthenticationToken authToken =
-                new UsernamePasswordAuthenticationToken(1L, null, Collections.emptyList());
-        SecurityContextHolder.getContext().setAuthentication(authToken);
+                new UsernamePasswordAuthenticationToken(
+                        principal,
+                        null,
+                        Collections.emptyList()
+                );
+
+        SecurityContextHolder.getContext()
+                .setAuthentication(authToken);
     }
 
-    private Account buildAccount(Long id, String accNo, BigDecimal balance) {
-        Account account = new Account();
-        account.setId(id);
-        account.setAccountNumber(accNo);
-        account.setBalance(balance);
-        account.setCurrency(Currency.INR);
-        account.setStatus(AccountStatus.ACTIVE);
-        return account;
-    }
-
-    @Test
-    void shouldThrowException_whenAmountIsNegative() {
-        TransferRequest request = new TransferRequest(1L, 2L, new BigDecimal("-100"));
-
-        IllegalArgumentException ex = assertThrows(IllegalArgumentException.class,
-                () -> transferService.createTransfer(request));
-
-        assertEquals("Transfer amount must be positive", ex.getMessage());
-        verifyNoInteractions(accountRepository);
+    @AfterEach
+    void tearDown() {
+        SecurityContextHolder.clearContext();
     }
 
     @Test
-    void shouldThrowException_whenSameAccountTransfer() {
-        TransferRequest request = new TransferRequest(1L, 1L, new BigDecimal("100"));
+    void shouldCompleteTransferSuccessfully() {
 
-        IllegalArgumentException ex = assertThrows(IllegalArgumentException.class,
-                () -> transferService.createTransfer(request));
+        String idempotencyKey = "test-key-123";
 
-        assertEquals("Cannot transfer to the same account", ex.getMessage());
+        TransferRequest request = new TransferRequest(
+                1L,
+                2L,
+                new BigDecimal("100.00")
+        );
+
+        TransferResponse expectedResponse = new TransferResponse(
+                "txn-123",
+                1L,
+                2L,
+                new BigDecimal("100.00"),
+                "SUCCESS"
+        );
+
+        when(idempotencyService.findByKey(idempotencyKey))
+                .thenReturn(Optional.empty());
+
+        when(transferInitiationService.createPendingTransfer(request))
+                .thenReturn("txn-123");
+
+        when(transferProcessingService.processTransfer(
+                "txn-123",
+                request,
+                1L
+        )).thenReturn(expectedResponse);
+
+        TransferResponse actualResponse =
+                transferService.createTransferIdempotent(
+                        idempotencyKey,
+                        request
+                );
+
+        assertNotNull(actualResponse);
+        assertEquals("txn-123", actualResponse.transactionId());
+        assertEquals("SUCCESS", actualResponse.status());
+
+        verify(idempotencyService).createInProgress(
+                eq(idempotencyKey),
+                anyString()
+        );
+
+        verify(transferInitiationService)
+                .createPendingTransfer(request);
+
+        verify(transferProcessingService)
+                .processTransfer("txn-123", request, 1L);
+
+        verify(idempotencyService)
+                .markCompleted(eq(idempotencyKey), anyString());
+
+        verifyNoInteractions(transferFailureService);
+        verifyNoInteractions(auditService);
     }
 
     @Test
-    void shouldThrowException_whenInsufficientBalance() {
-        Account fromAccount = buildAccount(1L, "ACC001", new BigDecimal("100"));
-        Account toAccount = buildAccount(2L, "ACC002", new BigDecimal("0"));
+    void shouldMarkTransferAndIdempotencyFailed_whenProcessingFails() {
 
-        when(accountRepository.findByIdForUpdate(1L)).thenReturn(Optional.of(fromAccount));
-        when(accountRepository.findByIdForUpdate(2L)).thenReturn(Optional.of(toAccount));
+        String idempotencyKey = "test-key-456";
 
-        TransferRequest request = new TransferRequest(1L, 2L, new BigDecimal("500"));
+        TransferRequest request = new TransferRequest(
+                1L,
+                2L,
+                new BigDecimal("500.00")
+        );
 
-        IllegalArgumentException ex = assertThrows(IllegalArgumentException.class,
-                () -> transferService.createTransfer(request));
+        RuntimeException exception =
+                new IllegalArgumentException("Insufficient balance");
 
-        assertTrue(ex.getMessage().contains("Insufficient balance"));
-    }
+        when(idempotencyService.findByKey(idempotencyKey))
+                .thenReturn(Optional.empty());
 
-    @Test
-    void shouldThrowException_whenFromAccountNotFound() {
-        when(accountRepository.findByIdForUpdate(1L)).thenReturn(Optional.empty());
+        when(transferInitiationService.createPendingTransfer(request))
+                .thenReturn("txn-456");
 
-        TransferRequest request = new TransferRequest(1L, 2L, new BigDecimal("100"));
+        when(transferProcessingService.processTransfer(
+                "txn-456",
+                request,
+                1L
+        )).thenThrow(exception);
 
-        assertThrows(IllegalArgumentException.class, () -> transferService.createTransfer(request));
+        RuntimeException actualException = assertThrows(
+                RuntimeException.class,
+                () -> transferService.createTransferIdempotent(
+                        idempotencyKey,
+                        request
+                )
+        );
+
+        assertEquals(
+                "Insufficient balance",
+                actualException.getMessage()
+        );
+
+        verify(transferFailureService).markFailed(
+                "txn-456",
+                "Insufficient balance"
+        );
+
+        verify(idempotencyService).markFailed(idempotencyKey);
+
+        verify(auditService).log(
+                1L,
+                "TRANSFER_FAILED",
+                "txn-456",
+                "FAILURE",
+                "Insufficient balance"
+        );
+
+        verify(idempotencyService, never())
+                .markCompleted(anyString(), anyString());
     }
 }

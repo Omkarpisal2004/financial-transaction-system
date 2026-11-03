@@ -1,41 +1,57 @@
-git statusHELP.md
+# Maven
+
 target/
 .mvn/wrapper/maven-wrapper.jar
-!**/src/main/**/target/
-!**/src/test/**/target/
 
-### STS ###
-.apt_generated
-.classpath
-.factorypath
-.project
-.settings
-.springBeans
-.sts4-cache
+# Java
 
-### IntelliJ IDEA ###
-.idea
+*.class
+
+# Environment variables and secrets
+
+.env
+.env.*
+!.env.example
+application-local.properties
+
+# Logs and temporary output
+
+*.log
+logs/
+dependency-tree.txt
+test-errors.txt
+test-output.txt
+
+# IntelliJ IDEA
+
+.idea/
 *.iws
 *.iml
 *.ipr
 
-### NetBeans ###
+# Eclipse / STS
+
+.apt_generated/
+.classpath
+.factorypath
+.project
+.settings/
+.springBeans
+.sts4-cache
+
+# NetBeans
+
 /nbproject/private/
 /nbbuild/
 /dist/
 /nbdist/
 /.nb-gradle/
+
+# VS Code
+
+.vscode/
+
+# Gradle
+
+.gradle/
 build/
-!**/src/main/**/build/
-!**/src/test/**/build/
-
-### VS Code ###
-.vscode/
-
-target/
-*.class
-.idea/
-*.iml
-.vscode/
-application-local.properties
-.env

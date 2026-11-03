@@ -26,9 +26,11 @@ public class LedgerEntry {
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
 
-    @ManyToOne(fetch = FetchType.LAZY, optional = false)
-    @JoinColumn(name = "transfer_id", nullable = false,
-            foreignKey = @ForeignKey(name = "fk_ledger_transfer"))
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(
+            name = "transfer_id",
+            foreignKey = @ForeignKey(name = "fk_ledger_transfer")
+    )
     private Transfer transfer;
 
     @ManyToOne(fetch = FetchType.LAZY, optional = false)

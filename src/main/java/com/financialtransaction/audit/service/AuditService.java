@@ -16,13 +16,22 @@ public class AuditService {
     }
 
     @Transactional(propagation = Propagation.REQUIRES_NEW)
-    public void log(Long userId, String action, String transactionId, String result, String details) {
-        AuditLog log = new AuditLog();
-        log.setUserId(userId);
-        log.setAction(action);
-        log.setTransactionId(transactionId);
-        log.setResult(result);
-        log.setDetails(details);
-        auditLogRepository.save(log);
+    public void log(
+            Long userId,
+            String action,
+            String transactionId,
+            String result,
+            String details) {
+
+        AuditLog auditLog = new AuditLog();
+
+        auditLog.setUserId(userId);
+        auditLog.setAction(action);
+        auditLog.setTransactionId(transactionId);
+        auditLog.setResult(result);
+        auditLog.setDetails(details);
+
+
+        auditLogRepository.saveAndFlush(auditLog);
     }
 }

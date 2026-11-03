@@ -3,34 +3,50 @@ package com.financialtransaction.auth.service;
 import com.financialtransaction.auth.dto.LoginRequest;
 import com.financialtransaction.auth.dto.LoginResponse;
 import com.financialtransaction.security.jwt.JwtUtil;
-import com.financialtransaction.user.entity.User;
-import com.financialtransaction.user.repository.UserRepository;
-import org.springframework.security.crypto.password.PasswordEncoder;
+import com.financialtransaction.security.userdetails.UserPrincipal;
+import org.springframework.security.authentication.AuthenticationManager;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.Authentication;
 import org.springframework.stereotype.Service;
 
 @Service
 public class AuthService {
 
-    private final UserRepository userRepository;
-    private final PasswordEncoder passwordEncoder;
+    private final AuthenticationManager authenticationManager;
     private final JwtUtil jwtUtil;
 
-    public AuthService(UserRepository userRepository, PasswordEncoder passwordEncoder, JwtUtil jwtUtil) {
-        this.userRepository = userRepository;
-        this.passwordEncoder = passwordEncoder;
+    public AuthService(
+            AuthenticationManager authenticationManager,
+            JwtUtil jwtUtil
+    ) {
+        this.authenticationManager = authenticationManager;
         this.jwtUtil = jwtUtil;
     }
 
     public LoginResponse login(LoginRequest request) {
-        User user = userRepository.findByEmail(request.email())
-                .orElseThrow(() -> new IllegalArgumentException("Invalid email or password"));
 
-        if (!passwordEncoder.matches(request.password(), user.getPasswordHash())) {
-            throw new IllegalArgumentException("Invalid email or password");
-        }
+        Authentication authentication =
+                authenticationManager.authenticate(
+                        new UsernamePasswordAuthenticationToken(
+                                request.email(),
+                                request.password()
+                        )
+                );
 
-        String token = jwtUtil.generateToken(user.getId(), user.getEmail());
-        return new LoginResponse(token, user.getId(), user.getEmail());
+        UserPrincipal userPrincipal =
+                (UserPrincipal) authentication.getPrincipal();
+
+        String token = jwtUtil.generateToken(
+                userPrincipal.getId(),
+                userPrincipal.getUsername(),
+                userPrincipal.getTokenVersion()
+        );
+
+        return new LoginResponse(
+                token,
+                userPrincipal.getId(),
+                userPrincipal.getUsername()
+        );
     }
-
 }
+

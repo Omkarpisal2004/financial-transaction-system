@@ -17,7 +17,7 @@ import java.time.LocalDateTime;
         uniqueConstraints = {
                 @UniqueConstraint(name = "uk_transfer_transaction_id", columnNames = "transaction_id")
         },
-        indexes = {
+        indexes = { //  fast accessing of data
                 @Index(name = "idx_transfer_from_account", columnList = "from_account_id"),
                 @Index(name = "idx_transfer_to_account", columnList = "to_account_id"),
                 @Index(name = "idx_transfer_status", columnList = "status")

@@ -1,22 +1,35 @@
 package com.financialtransaction.idempotency.util;
 
+import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.util.HexFormat;
 
-public class HashUtil {
+public final class HashUtil {
+
+    private HashUtil() {
+        // Utility class; prevent instantiation.
+    }
+
     public static String sha256(String input) {
+        if (input == null) {
+            throw new IllegalArgumentException("Input cannot be null");
+        }
+
         try {
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            byte[] hash = digest.digest(input.getBytes());
-            StringBuilder hexString = new StringBuilder();
-            for (byte b : hash) {
-                String hex = Integer.toHexString(0xff & b);
-                if (hex.length() == 1) hexString.append('0');
-                hexString.append(hex);
-            }
-            return hexString.toString();
+
+            byte[] hash = digest.digest(
+                    input.getBytes(StandardCharsets.UTF_8)
+            );
+
+            return HexFormat.of().formatHex(hash);
+
         } catch (NoSuchAlgorithmException e) {
-            throw new RuntimeException("Hashing failed", e);
+            throw new IllegalStateException(
+                    "SHA-256 algorithm is unavailable", e
+            );
         }
     }
 }
+

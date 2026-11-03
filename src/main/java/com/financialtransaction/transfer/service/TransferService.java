@@ -1,198 +1,307 @@
 package com.financialtransaction.transfer.service;
 
-import com.financialtransaction.account.entity.Account;
-import com.financialtransaction.account.repository.AccountRepository;
 import com.financialtransaction.audit.service.AuditService;
 import com.financialtransaction.idempotency.entity.IdempotencyRecord;
 import com.financialtransaction.idempotency.entity.IdempotencyStatus;
-import com.financialtransaction.idempotency.repository.IdempotencyRecordRepository;
+import com.financialtransaction.idempotency.service.IdempotencyService;
 import com.financialtransaction.idempotency.util.HashUtil;
-import com.financialtransaction.ledger.entity.EntryType;
-import com.financialtransaction.ledger.entity.LedgerEntry;
-import com.financialtransaction.ledger.repository.LedgerEntryRepository;
+import com.financialtransaction.security.userdetails.UserPrincipal;
 import com.financialtransaction.transfer.dto.TransferRequest;
 import com.financialtransaction.transfer.dto.TransferResponse;
 import com.financialtransaction.transfer.entity.Transfer;
-import com.financialtransaction.transfer.entity.TransferStatus;
 import com.financialtransaction.transfer.repository.TransferRepository;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.security.access.AccessDeniedException;
+import org.springframework.security.core.Authentication;
+import org.springframework.security.core.authority.SimpleGrantedAuthority;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
 import tools.jackson.databind.ObjectMapper;
-
-import java.math.BigDecimal;
-import java.util.UUID;
 
 @Service
 public class TransferService {
 
-    private final AccountRepository accountRepository;
+    private static final Logger logger =
+            LoggerFactory.getLogger(TransferService.class);
+
     private final TransferRepository transferRepository;
-    private final LedgerEntryRepository ledgerEntryRepository;
-    private final IdempotencyRecordRepository idempotencyRecordRepository;
-    private final ObjectMapper objectMapper = new ObjectMapper();
+    private final IdempotencyService idempotencyService;
+    private final TransferInitiationService transferInitiationService;
+    private final TransferProcessingService transferProcessingService;
+    private final TransferFailureService transferFailureService;
+    private final ObjectMapper objectMapper;
     private final AuditService auditService;
-    private static final Logger logger = LoggerFactory.getLogger(TransferService.class);
     private final MeterRegistry meterRegistry;
 
-    public TransferService(AccountRepository accountRepository,
-                           TransferRepository transferRepository,
-                           LedgerEntryRepository ledgerEntryRepository,
-                           IdempotencyRecordRepository idempotencyRecordRepository,
-                           AuditService auditService,
-                           MeterRegistry meterRegistry) {
-        this.accountRepository = accountRepository;
+    public TransferService(
+            TransferRepository transferRepository,
+            IdempotencyService idempotencyService,
+            TransferInitiationService transferInitiationService,
+            TransferProcessingService transferProcessingService,
+            TransferFailureService transferFailureService,
+            ObjectMapper objectMapper,
+            AuditService auditService,
+            MeterRegistry meterRegistry
+    ) {
         this.transferRepository = transferRepository;
-        this.ledgerEntryRepository = ledgerEntryRepository;
-        this.idempotencyRecordRepository = idempotencyRecordRepository;
+        this.idempotencyService = idempotencyService;
+        this.transferInitiationService = transferInitiationService;
+        this.transferProcessingService = transferProcessingService;
+        this.transferFailureService = transferFailureService;
+        this.objectMapper = objectMapper;
         this.auditService = auditService;
         this.meterRegistry = meterRegistry;
     }
 
+    public TransferResponse createTransferIdempotent(
+            String idempotencyKey,
+            TransferRequest request
+    ) {
 
-
-
-    @Transactional
-    public TransferResponse createTransferIdempotent(String idempotencyKey, TransferRequest request) {
-        // If no key provided, just process normally (idempotency optional)
         if (idempotencyKey == null || idempotencyKey.isBlank()) {
-            return createTransfer(request);
+            throw new IllegalArgumentException(
+                    "Idempotency-Key is required"
+            );
         }
 
-        String requestPayload;
+        Long currentUserId = getCurrentUserId();
+
+        String requestHash = calculateRequestHash(request);
+
+        // STEP 1: Check whether this key already exists.
+        var existing = idempotencyService.findByKey(idempotencyKey);
+
+        if (existing.isPresent()) {
+            return handleExistingRequest(
+                    existing.get(),
+                    requestHash,
+                    idempotencyKey
+            );
+        }
+
+        // STEP 2: Save IN_PROGRESS independently.
         try {
-            requestPayload = objectMapper.writeValueAsString(request);
-        } catch (Exception e) {
-            throw new RuntimeException("Failed to serialize request", e);
-        }
-        String requestHash = HashUtil.sha256(requestPayload);
+            idempotencyService.createInProgress(
+                    idempotencyKey,
+                    requestHash
+            );
+        } catch (DataIntegrityViolationException exception) {
 
-        var existingOpt = idempotencyRecordRepository.findByIdempotencyKey(idempotencyKey);
+            // Another concurrent request may have inserted the same key.
+            var concurrentRecord =
+                    idempotencyService.findByKey(idempotencyKey);
 
-        if (existingOpt.isPresent()) {
-            IdempotencyRecord existing = existingOpt.get();
-
-            if (!existing.getRequestHash().equals(requestHash)) {
-                throw new IllegalArgumentException(
-                        "Idempotency key already used with a different request payload: " + idempotencyKey);
+            if (concurrentRecord.isPresent()) {
+                return handleExistingRequest(
+                        concurrentRecord.get(),
+                        requestHash,
+                        idempotencyKey
+                );
             }
 
-            if (existing.getStatus() == IdempotencyStatus.COMPLETED) {
+            throw exception;
+        }
+
+        String transactionId = null;
+
+        try {
+
+            // STEP 3: Create PENDING transfer independently.
+            transactionId =
+                    transferInitiationService.createPendingTransfer(request);
+
+            // STEP 4: Process transfer atomically.
+            TransferResponse response =
+                    transferProcessingService.processTransfer(
+                            transactionId,
+                            request,
+                            currentUserId
+                    );
+
+            // STEP 5: Processing has committed successfully.
+            String responseBody = objectMapper.writeValueAsString(response);
+
+            idempotencyService.markCompleted(
+                    idempotencyKey,
+                    responseBody
+            );
+
+            meterRegistry.counter("transfers.success").increment();
+
+            logger.info(
+                    "Transfer completed successfully: transactionId={}",
+                    transactionId
+            );
+
+            return response;
+
+        } catch (RuntimeException exception) {
+
+            logger.error(
+                    "Transfer failed: transactionId={}, reason={}",
+                    transactionId,
+                    exception.getMessage(),
+                    exception
+            );
+
+            meterRegistry.counter("transfers.failure").increment();
+
+            // STEP 6: Mark existing PENDING transfer as FAILED.
+            if (transactionId != null) {
                 try {
-                    return objectMapper.readValue(existing.getResponseBody(), TransferResponse.class);
-                } catch (Exception e) {
-                    throw new RuntimeException("Failed to deserialize stored response", e);
+                    transferFailureService.markFailed(
+                            transactionId,
+                            exception.getMessage()
+                    );
+                } catch (RuntimeException failureException) {
+                    logger.error(
+                            "Failed to mark transfer as FAILED: {}",
+                            transactionId,
+                            failureException
+                    );
+
+                    exception.addSuppressed(failureException);
                 }
             }
 
-            // IN_PROGRESS or FAILED — for simplicity, reject concurrent duplicate while in progress
-            throw new IllegalStateException("Request with this idempotency key is already being processed: " + idempotencyKey);
-        }
+            // STEP 7: Mark idempotency record as FAILED.
+            try {
+                idempotencyService.markFailed(idempotencyKey);
+            } catch (RuntimeException failureException) {
+                logger.error(
+                        "Failed to update idempotency record",
+                        failureException
+                );
 
-        // New key — create a record in IN_PROGRESS state first
-        IdempotencyRecord record = new IdempotencyRecord();
-        record.setIdempotencyKey(idempotencyKey);
-        record.setRequestHash(requestHash);
-        record.setStatus(IdempotencyStatus.IN_PROGRESS);
-        idempotencyRecordRepository.save(record);
-
-        TransferResponse response = createTransfer(request);
-
-        try {
-            record.setResponseBody(objectMapper.writeValueAsString(response));
-            record.setStatus(IdempotencyStatus.COMPLETED);
-            idempotencyRecordRepository.save(record);
-        } catch (Exception e) {
-            throw new RuntimeException("Failed to serialize response for idempotency record", e);
-        }
-
-        return response;
-    }
-
-
-    @Transactional
-    public TransferResponse createTransfer(TransferRequest request) {
-        Long currentUserId = (Long) SecurityContextHolder.getContext().getAuthentication().getPrincipal();
-        String txnId = UUID.randomUUID().toString(); // generate early for logging consistency
-
-        logger.info("Transfer started: from={}, to={}, amount={}, user={}",
-                request.fromAccountId(), request.toAccountId(), request.amount(), currentUserId);
-
-        try {
-            if (request.amount() == null || request.amount().compareTo(BigDecimal.ZERO) <= 0) {
-                throw new IllegalArgumentException("Transfer amount must be positive");
-            }
-            if (request.fromAccountId().equals(request.toAccountId())) {
-                throw new IllegalArgumentException("Cannot transfer to the same account");
+                exception.addSuppressed(failureException);
             }
 
-            Long firstLockId = Math.min(request.fromAccountId(), request.toAccountId());
-            Long secondLockId = Math.max(request.fromAccountId(), request.toAccountId());
+            // Preserve existing failure audit behavior.
+            try {
+                auditService.log(
+                        currentUserId,
+                        "TRANSFER_FAILED",
+                        transactionId,
+                        "FAILURE",
+                        exception.getMessage()
+                );
+            } catch (RuntimeException auditException) {
+                logger.error(
+                        "Failed to persist transfer failure audit",
+                        auditException
+                );
 
-            Account firstLocked = accountRepository.findByIdForUpdate(firstLockId)
-                    .orElseThrow(() -> new IllegalArgumentException("Account not found: " + firstLockId));
-            Account secondLocked = accountRepository.findByIdForUpdate(secondLockId)
-                    .orElseThrow(() -> new IllegalArgumentException("Account not found: " + secondLockId));
-
-            Account fromAccount = firstLocked.getId().equals(request.fromAccountId()) ? firstLocked : secondLocked;
-            Account toAccount = firstLocked.getId().equals(request.toAccountId()) ? firstLocked : secondLocked;
-
-            if (fromAccount.getBalance().compareTo(request.amount()) < 0) {
-                throw new IllegalArgumentException("Insufficient balance in account: " + fromAccount.getAccountNumber());
+                exception.addSuppressed(auditException);
             }
 
-            fromAccount.setBalance(fromAccount.getBalance().subtract(request.amount()));
-            accountRepository.save(fromAccount);
-
-            toAccount.setBalance(toAccount.getBalance().add(request.amount()));
-            accountRepository.save(toAccount);
-
-            Transfer transfer = new Transfer();
-            transfer.setTransactionId(UUID.randomUUID().toString());
-            transfer.setFromAccount(fromAccount);
-            transfer.setToAccount(toAccount);
-            transfer.setAmount(request.amount());
-            transfer.setStatus(TransferStatus.SUCCESS);
-            Transfer savedTransfer = transferRepository.save(transfer);
-
-            LedgerEntry debitEntry = new LedgerEntry();
-            debitEntry.setTransfer(savedTransfer);
-            debitEntry.setAccount(fromAccount);
-            debitEntry.setEntryType(EntryType.DEBIT);
-            debitEntry.setAmount(request.amount());
-            ledgerEntryRepository.save(debitEntry);
-
-            LedgerEntry creditEntry = new LedgerEntry();
-            creditEntry.setTransfer(savedTransfer);
-            creditEntry.setAccount(toAccount);
-            creditEntry.setEntryType(EntryType.CREDIT);
-            creditEntry.setAmount(request.amount());
-            ledgerEntryRepository.save(creditEntry);
-
-            auditService.log(currentUserId, "TRANSFER_COMPLETED", savedTransfer.getTransactionId(), "SUCCESS",
-                    "Transferred " + request.amount() + " from account " + fromAccount.getId() + " to " + toAccount.getId());
-
-            logger.info("Transfer completed: txnId={}, amount={}", savedTransfer.getTransactionId(), request.amount());
-            meterRegistry.counter("transfers.success").increment();
-
-            return TransferResponse.from(savedTransfer);
-
-        } catch (Exception e) {
-            logger.error("Transfer failed: from={}, to={}, reason={}",
-                    request.fromAccountId(), request.toAccountId(), e.getMessage());
-            auditService.log(currentUserId, "TRANSFER_FAILED", null, "FAILURE", e.getMessage());
-            meterRegistry.counter("transfers.failure").increment();
-            throw e;
+            throw exception;
         }
     }
 
+    private TransferResponse handleExistingRequest(
+            IdempotencyRecord existing,
+            String requestHash,
+            String idempotencyKey
+    ) {
+
+        if (!existing.getRequestHash().equals(requestHash)) {
+            throw new IllegalArgumentException(
+                    "Idempotency key already used with a different request payload"
+            );
+        }
+
+        if (existing.getStatus() == IdempotencyStatus.COMPLETED) {
+            try {
+                return objectMapper.readValue(
+                        existing.getResponseBody(),
+                        TransferResponse.class
+                );
+            } catch (Exception exception) {
+                throw new IllegalStateException(
+                        "Failed to deserialize stored transfer response",
+                        exception
+                );
+            }
+        }
+
+        if (existing.getStatus() == IdempotencyStatus.IN_PROGRESS) {
+            throw new IllegalStateException(
+                    "Request with this idempotency key is already being processed: "
+                            + idempotencyKey
+            );
+        }
+
+        throw new IllegalStateException(
+                "Previous request with this idempotency key failed: "
+                        + idempotencyKey
+        );
+    }
+
+    private String calculateRequestHash(TransferRequest request) {
+
+        try {
+            String payload = objectMapper.writeValueAsString(request);
+            return HashUtil.sha256(payload);
+
+        } catch (Exception exception) {
+            throw new IllegalStateException(
+                    "Failed to serialize transfer request",
+                    exception
+            );
+        }
+    }
+
+    private Long getCurrentUserId() {
+
+        Authentication authentication =
+                SecurityContextHolder.getContext().getAuthentication();
+
+        UserPrincipal principal =
+                (UserPrincipal) authentication.getPrincipal();
+
+        return principal.getId();
+    }
 
     public TransferResponse getByTransactionId(String transactionId) {
-        Transfer transfer = transferRepository.findByTransactionId(transactionId)
-                .orElseThrow(() -> new IllegalArgumentException("Transfer not found: " + transactionId));
+
+        Transfer transfer = transferRepository
+                .findByTransactionId(transactionId)
+                .orElseThrow(() ->
+                        new IllegalArgumentException(
+                                "Transfer not found: " + transactionId
+                        ));
+
+        Authentication authentication =
+                SecurityContextHolder.getContext().getAuthentication();
+
+        boolean isAdmin = authentication.getAuthorities()
+                .contains(new SimpleGrantedAuthority("ROLE_ADMIN"));
+
+        if (!isAdmin) {
+
+            UserPrincipal principal =
+                    (UserPrincipal) authentication.getPrincipal();
+
+            Long currentUserId = principal.getId();
+
+            Long fromUserId =
+                    transfer.getFromAccount().getUser().getId();
+
+            Long toUserId =
+                    transfer.getToAccount().getUser().getId();
+
+            if (!currentUserId.equals(fromUserId)
+                    && !currentUserId.equals(toUserId)) {
+
+                throw new AccessDeniedException(
+                        "You do not have permission to view this transfer"
+                );
+            }
+        }
+
         return TransferResponse.from(transfer);
     }
 }

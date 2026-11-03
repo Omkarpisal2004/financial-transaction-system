@@ -7,6 +7,10 @@ import org.springframework.data.jpa.domain.Specification;
 import java.time.LocalDateTime;
 
 public class LedgerEntrySpecification {
+// JPA criteria API
+    // root -> the field that we have to access
+    // query -> represent the overall query
+    // cb(criteria builder ) -> it says based on the criteria like > , < , = etc fetch records
 
     public static Specification<LedgerEntry> hasAccountId(Long accountId) {
         return (root, query, cb) -> cb.equal(root.get("account").get("id"), accountId);
